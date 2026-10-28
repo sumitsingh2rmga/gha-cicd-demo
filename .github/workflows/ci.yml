@@ -49,7 +49,7 @@ jobs:
  # ---------- Stage 2: SonarQube scan on your laptop (self-hosted runner) ----------
   sonarqube:
     name: 2 - SonarQube scan and quality gate (local server)
-    needs: lint-and-test
+    needs: [lint, test]
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, linux, sonar-local]
     steps:
