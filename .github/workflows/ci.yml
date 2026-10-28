@@ -46,23 +46,31 @@ jobs:
       - run: npm install
       - run: npm run build
 
-  sonar:
-    needs: [lint, test]
-    runs-on: ubuntu-latest
+ # ---------- Stage 2: SonarQube scan on your laptop (self-hosted runner) ----------
+  sonarqube:
+    name: 2 - SonarQube scan and quality gate (local server)
+    needs: lint-and-test
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, sonar-local]
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - name: Download coverage report
+        uses: actions/download-artifact@v4
         with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      # Sonar's coverage gate needs an lcov report; without it new-code coverage reads as 0%.
-      - run: npm run test:coverage
-      - uses: sonarsource/sonarqube-scan-action@v4
+          name: coverage-report
+          path: app
+      - name: SonarQube scan
+        uses: SonarSource/sonarqube-scan-action@v4.1.0
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: http://localhost:9000
+        with:
+          projectBaseDir: app
+          args: -Dsonar.qualitygate.wait=true
+
+#
 
   docker-build-scan-push:
     needs: [build, sonar]
