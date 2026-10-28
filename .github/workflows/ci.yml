@@ -73,7 +73,7 @@ jobs:
 #
 
   docker-build-scan-push:
-    needs: [build, sonar]
+    needs: [build, sonarqube]
     runs-on: ubuntu-latest
     permissions:
       contents: read
