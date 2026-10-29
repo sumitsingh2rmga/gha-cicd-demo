@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:          # ADDED: gives you a "Run workflow" button (your sonarqube job already checks for it)
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -46,34 +47,40 @@ jobs:
       - run: npm install
       - run: npm run build
 
- # ---------- Stage 2: SonarQube scan on your laptop (self-hosted runner) ----------
+  # ---------- Stage 2: SonarQube scan on your laptop (self-hosted runner) ----------
   sonarqube:
     name: 2 - SonarQube scan and quality gate (local server)
     needs: [lint, test]
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, linux, sonar-local]
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Download coverage report
-        uses: actions/download-artifact@v4
+      - uses: actions/setup-node@v4
         with:
-          name: coverage-report
-          path: app
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # FIXED: the coverage report is created here, in the same job. The old
+      # "download-artifact coverage-report" step failed because no job ever uploaded that artifact.
+      - run: npm run test:coverage
+      - name: Check that the coverage report exists
+        run: ls -l coverage/lcov.info
       - name: SonarQube scan
         uses: SonarSource/sonarqube-scan-action@v5
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: http://localhost:9000
+        # FIXED: no projectBaseDir. Your code is at the repo root (src/, public/, test/), not in an app/ folder.
         with:
-          projectBaseDir: app
           args: -Dsonar.qualitygate.wait=true
-
-#
 
   docker-build-scan-push:
     needs: [build, sonarqube]
+    # ADDED: sonarqube is skipped on pull requests, so allow "skipped" but never "failed".
+    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.sonarqube.result == 'success' || needs.sonarqube.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -95,7 +102,7 @@ jobs:
           build-args: GIT_SHA=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - uses: aquasecurity/trivy-action@master
+      - uses: aquasecurity/trivy-action@master   # pin to a release tag or commit SHA (check the Marketplace)
         with:
           image-ref: ${{ steps.meta.outputs.image }}
           format: sarif
@@ -116,34 +123,37 @@ jobs:
         if: github.event_name == 'push'
         run: docker push ${{ steps.meta.outputs.image }}
 
+  # CHANGED: points at YOUR fork, and opens + merges a pull request instead of pushing to main.
   update-manifest:
     needs: docker-build-scan-push
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     env:
-      GH_TOKEN: ${{ secrets.DEPLOY_PAT }}
+      GH_TOKEN: ${{ secrets.DEPLOY_PAT }}        # fine-grained token for YOUR fork (Contents + Pull requests: read and write)
+      GH_REPO: sumitsingh2rmga/gha-cicd-demo-manifests
+      IMAGE: ${{ needs.docker-build-scan-push.outputs.image }}
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: goswami97/gha-cicd-demo-manifests
+          repository: sumitsingh2rmga/gha-cicd-demo-manifests
           token: ${{ secrets.DEPLOY_PAT }}
-      - name: Bump image tag and push
+      - name: Open and merge a pull request that bumps the development image
         run: |
-          sed -i "s|image: ghcr.io/.*|image: ${{ needs.docker-build-scan-push.outputs.image }}|" development/deployment.yaml
+          BRANCH="ci/development-${GITHUB_SHA::7}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add development/deployment.yaml
-          if git diff --staged --quiet; then
+          git checkout -b "$BRANCH"
+          sed -i -E "s|(image:[[:space:]]*)[^[:space:]]*gha-cicd-demo[^[:space:]]*|\1${IMAGE}|" development/deployment.yaml
+          if git diff --quiet; then
             echo "No manifest change, skipping."
             exit 0
           fi
-          git commit -m "chore: deploy development gha-cicd-demo@${{ github.sha }}"
-          # Promote workflows push to the same repo; each touches a different file, so a rebase never conflicts.
-          for attempt in 1 2 3 4 5; do
-            git push origin main && exit 0
-            echo "Push rejected (attempt $attempt), rebasing onto latest main..."
-            git pull --rebase origin main
-          done
-          echo "::error::Could not push manifest update after 5 attempts."
-          exit 1
-
+          git add development/deployment.yaml
+          git commit -m "chore: deploy development gha-cicd-demo@${GITHUB_SHA}"
+          git push --force -u origin "$BRANCH"
+          PR_URL="$(gh pr create --base main --head "$BRANCH" \
+            --title "development: deploy ${GITHUB_SHA::7}" \
+            --body "Automated image bump from the app repo CI (commit ${GITHUB_SHA}).")"
+          echo "Pull request: $PR_URL" | tee -a "$GITHUB_STEP_SUMMARY"
+          gh pr merge "$PR_URL" --squash
+          git push origin --delete "$BRANCH" || true
